@@ -52,6 +52,7 @@ kalei.com/
     Controller.php
     Db.php
     Mapper.php
+  TOOLS/
     MakeMappers.php
   app/
     controllers/
@@ -126,20 +127,48 @@ If host/user/pass/name/port/socket are missing or empty, Kalix fills them from:
 
 ## Mapper Generator
 
-Generate mappers/models from DB schema:
+Generate mappers/models (schema-first workflow):
 
 ```bash
-php Kalix/MakeMappers.php --app="$(pwd)/app" --db=default
+php TOOLS/MakeMappers.php --app="$(pwd)/app" --db=default
 ```
 
-What it does:
+What `MakeMappers.php` does now:
 
-- Inspects tables and views from `information_schema`.
-- Generates one mapper class per table/view in `app/mappers/`.
-- Creates corresponding model in `app/models/` if missing.
-- Maps MySQL types to PHP types.
-- Emits warnings when SQL types differ from Kalix recommended storage types.
-- Embeds schema details into mapper comments.
+- Runs `TOOLS/myDump.php` first.
+- Expects `schema.json` and `schema.xlsx` to be generated (default directory: `app/database/`).
+- Uses `schema.json` as the source of truth to generate/rebuild `app/mappers/*`.
+- Creates missing `app/models/*` files.
+
+Optional schema directory override:
+
+```bash
+php TOOLS/MakeMappers.php --schema-dir="$(pwd)"
+```
+
+Interactive mode (passed through to `myDump`):
+
+```bash
+./TOOLS/MakeMappers.php -i --db=default
+```
+
+SSH mode (passed through to `myDump`):
+
+```bash
+./TOOLS/MakeMappers.php --ssh --db=default
+```
+
+Interactive SSH mode:
+
+```bash
+./TOOLS/MakeMappers.php -i --ssh --db=default
+```
+
+Suggested cycle:
+
+1. Edit `schema.json` or `schema.xlsx`.
+2. Apply schema changes to DB with `myDump`.
+3. Run `MakeMappers.php` to refresh `schema.*` from DB and rebuild mappers.
 
 ## Notes
 
@@ -150,4 +179,3 @@ What it does:
 ---
 
 Original Kalix artwork is included at `public/img/kalix-aurora.svg`.
-q
