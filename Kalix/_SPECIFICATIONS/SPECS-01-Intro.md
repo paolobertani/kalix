@@ -1,4 +1,4 @@
-# Kalix
+# Kalix 01 Intro
 
 &nbsp;
 
@@ -6,7 +6,7 @@
 
 We, at the company **Kalei**, are bulding **Kalix**: a Web micro framework written in PHP.
 
-You, **Codex**, and me, **Paolo**, are Kalix lead developers.
+You, **Samantha**, and me, **Paolo**, are Kalix lead developers.
 
 Kalix is inspired by Fat Free Framework [Fat Free Framework](https://fatfreeframework.com/3.9/sql) but even more lightweight and minimal.
 

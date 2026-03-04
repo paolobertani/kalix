@@ -15,6 +15,7 @@ abstract class Mapper
     protected static string $primaryKey = 'id';
     protected static bool $readOnly = false;
     protected static array $types = [];
+    protected ConnectionProvider $connections;
     protected mysqli $db;
 
 
@@ -25,9 +26,10 @@ abstract class Mapper
      * Creates a mapper and resolves the shared database connection.
      */
 
-    public function __construct(string $connectionName = 'default')
+    public function __construct(string $connectionName = 'default', ?ConnectionProvider $connections = null)
     {
-        $this->db = Db::connection($connectionName);
+        $this->connections = $connections ?? new DbConnectionProvider();
+        $this->db = $this->connections->connection($connectionName);
     }
 
 

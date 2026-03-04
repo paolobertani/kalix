@@ -12,9 +12,10 @@ final class Kalix
     private string $rootPath;
     private string $appPath;
     private Router $router;
-    private Router $routerWithoutLang;
     private array $locales = [];
     private string $fallbackLang = 'en';
+    private bool $errorHandlersRegistered = false;
+    private bool $handlingErrorController = false;
 
 
 
@@ -30,9 +31,9 @@ final class Kalix
         $this->appPath = rtrim((string)($cfg['app'] ?? ($this->rootPath . '/app')), '/');
 
         Autoload::register(__DIR__, $this->appPath);
+        $this->registerErrorHandlers();
 
         $this->router = new Router();
-        $this->routerWithoutLang = new Router();
 
         $this->loadDatabaseConfig();
         $this->loadLocales();
@@ -44,17 +45,12 @@ final class Kalix
     /*
      * Register route.
      *
-     * Registers a localized route and its unlocalized variant.
+     * Registers one route pattern and its dispatch target.
      */
 
     public function route(string $pattern, string $target): self
     {
         $this->router->add($pattern, $target);
-
-        $unlocalized = $this->stripLangPlaceholder($pattern);
-        if ($unlocalized !== null) {
-            $this->routerWithoutLang->add($unlocalized, $target);
-        }
 
         return $this;
     }
@@ -73,32 +69,433 @@ final class Kalix
         $query = $this->requestQuery();
 
         try {
-            $localized = $this->router->match($path);
+            $resolved = $this->router->resolve($path);
 
-            if ($localized !== null && $this->hasSupportedLang($localized)) {
-                $lang = strtolower((string)$localized['params']['lang']);
+            if (($resolved['status'] ?? '') === 'matched') {
+                $match = is_array($resolved['match'] ?? null) ? $resolved['match'] : [];
+                $hasLang = (bool)($match['has_lang'] ?? false);
+
+                if ($hasLang) {
+                    $lang = strtolower((string)($match['params']['lang'] ?? ''));
+                    if (!$this->isSupportedLocale($lang)) {
+                        $this->send404();
+                        return;
+                    }
+
+                    $this->dispatch($match, $lang);
+                    return;
+                }
+
+                $lang = $this->resolvePreferredLanguage();
                 $this->persistLanguage($lang);
-                $this->dispatch($localized, $lang);
+                $this->dispatch($match, $lang);
                 return;
             }
 
-            [$missingLangMatch, $basePath] = $this->matchWithoutLanguage($path);
+            $missingLangMatch = $this->router->matchWithoutLanguage($path);
             if ($missingLangMatch !== null) {
                 $lang = $this->resolvePreferredLanguage();
                 $this->persistLanguage($lang);
-                $this->redirect($this->buildLocalizedPath($basePath, $lang), $query);
+                $localizedPath = $this->router->buildPathWithLanguage($missingLangMatch, $lang);
+                $this->redirect($localizedPath, $query, 301);
+                return;
+            }
+
+            if (($resolved['status'] ?? '') === 'malformed') {
+                $this->send400();
                 return;
             }
 
             $this->send404();
+        } catch (BadRequestException $e) {
+            $this->send400($e->getMessage(), $this->formatThrowableStackBacktrace($e));
         } catch (Throwable $e) {
-            if (PHP_SAPI === 'cli') {
-                throw $e;
+            $this->handleThrowable($e);
+        }
+    }
+
+
+
+    /*
+     * Register error handlers.
+     *
+     * Installs handlers for PHP runtime errors and fatal shutdown errors.
+     */
+
+    private function registerErrorHandlers(): void
+    {
+        if ($this->errorHandlersRegistered) {
+            return;
+        }
+
+        set_error_handler(function (int $severity, string $message, string $file, int $line): bool {
+            if ((error_reporting() & $severity) === 0) {
+                return false;
             }
 
-            http_response_code(500);
-            echo '500 Internal Server Error';
+            $trace = debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS);
+            $stack = $this->formatPhpErrorStackBacktrace($trace, $file, $line);
+
+            throw new PhpErrorException($severity, $message, $file, $line, $stack);
+        });
+
+        set_exception_handler(function (Throwable $e): void {
+            $this->handleThrowable($e);
+        });
+
+        register_shutdown_function(function (): void {
+            $last = error_get_last();
+            if (!is_array($last)) {
+                return;
+            }
+
+            $type = (int)($last['type'] ?? 0);
+            if (!$this->isFatalPhpErrorType($type)) {
+                return;
+            }
+
+            $message = (string)($last['message'] ?? 'Fatal PHP error');
+            $file = (string)($last['file'] ?? '');
+            $line = (int)($last['line'] ?? 0);
+            $stack = [[
+                'file_path' => $file,
+                'function_name' => '',
+                'line_number' => $line,
+            ]];
+
+            $this->send500($message, $stack);
+        });
+
+        $this->errorHandlersRegistered = true;
+    }
+
+
+
+    /*
+     * Handle throwable.
+     *
+     * Converts exceptions into HTTP errors and optional custom error pages.
+     */
+
+    private function handleThrowable(Throwable $e): void
+    {
+        if ($e instanceof PhpErrorException) {
+            $message = $this->formatPhpErrorMessage($e);
+            $this->send500($message, $e->stackBacktrace());
+            return;
         }
+
+        $code = $this->normalizeHttpErrorCode((int)$e->getCode(), 500);
+        $message = $e->getMessage();
+        $stack = $this->formatThrowableStackBacktrace($e);
+
+        if ($code === 400) {
+            $this->send400($message, $stack);
+            return;
+        }
+
+        if ($code === 404) {
+            $this->send404($message, $stack);
+            return;
+        }
+
+        $this->send500($message, $stack);
+    }
+
+
+
+    /*
+     * Dispatch error controller.
+     *
+     * Calls `controllers\error->error(...)` when available.
+     */
+
+    private function dispatchErrorController(int $code, ?string $error = null, ?array $stackBacktrace = null): bool
+    {
+        if ($this->handlingErrorController) {
+            return false;
+        }
+
+        $class = 'controllers\\error';
+        if (!class_exists($class)) {
+            return false;
+        }
+
+        $this->handlingErrorController = true;
+        try {
+            $controller = new $class();
+            if (!$controller instanceof Controller) {
+                return false;
+            }
+
+            if (!method_exists($controller, 'error')) {
+                return false;
+            }
+
+            $reflection = new ReflectionMethod($controller, 'error');
+            if (!$reflection->isPublic()) {
+                if (!headers_sent()) {
+                    http_response_code(400);
+                }
+
+                echo $this->defaultErrorText(400);
+                return true;
+            }
+
+            $lang = $this->resolveLanguageForErrorContext();
+            $intl = $this->locales[$lang] ?? [];
+            $this->setRequestContext($lang, $intl);
+            $controller->setContext($this->appPath, $lang, $intl);
+
+            $reflection->invoke($controller, $code, $error, $stackBacktrace);
+            return true;
+        } catch (Throwable) {
+            if (!headers_sent()) {
+                http_response_code(500);
+            }
+
+            echo $this->defaultErrorText(500);
+            return true;
+        } finally {
+            $this->handlingErrorController = false;
+        }
+    }
+
+
+
+    /*
+     * Set request context.
+     *
+     * Stores request-level context values in the shared registry.
+     */
+
+    private function setRequestContext(string $lang, array $intl): void
+    {
+        Registry::set('/ctx/root', $this->rootPath);
+        Registry::set('/ctx/app', $this->appPath);
+        Registry::set('/ctx/lang', $lang);
+        Registry::set('/ctx/intl', $intl);
+        Registry::set('/ctx/locales', $this->locales);
+    }
+
+
+
+    /*
+     * Resolve error language.
+     *
+     * Prefers URL locale and falls back to preferred language detection.
+     */
+
+    private function resolveLanguageForErrorContext(): string
+    {
+        $path = $this->requestPath();
+        $segments = explode('/', trim($path, '/'));
+        $first = strtolower((string)($segments[0] ?? ''));
+
+        if (preg_match('/^[a-z]{2}$/', $first) === 1 && $this->isSupportedLocale($first)) {
+            return $first;
+        }
+
+        return $this->resolvePreferredLanguage();
+    }
+
+
+
+    /*
+     * Normalize throwable stack.
+     *
+     * Returns trace frames where the last item is the error location.
+     */
+
+    private function formatThrowableStackBacktrace(Throwable $e): array
+    {
+        $items = [];
+        $trace = $e->getTrace();
+        $ordered = array_reverse($trace);
+
+        foreach ($ordered as $frame) {
+            $items[] = $this->stackItemFromFrame($frame);
+        }
+
+        $items[] = [
+            'file_path' => $e->getFile(),
+            'function_name' => (string)($trace[0]['function'] ?? ''),
+            'line_number' => $e->getLine(),
+        ];
+
+        return $this->normalizeStackBacktrace($items);
+    }
+
+
+
+    /*
+     * Normalize PHP error stack.
+     *
+     * Returns trace frames where the last item is the PHP error location.
+     */
+
+    private function formatPhpErrorStackBacktrace(array $trace, string $file, int $line): array
+    {
+        $items = [];
+        $ordered = array_reverse($trace);
+
+        foreach ($ordered as $frame) {
+            $items[] = $this->stackItemFromFrame($frame);
+        }
+
+        $items[] = [
+            'file_path' => $file,
+            'function_name' => '',
+            'line_number' => $line,
+        ];
+
+        return $this->normalizeStackBacktrace($items);
+    }
+
+
+
+    /*
+     * Stack item from frame.
+     *
+     * Maps one debug backtrace frame to the specification format.
+     */
+
+    private function stackItemFromFrame(array $frame): array
+    {
+        return [
+            'file_path' => (string)($frame['file'] ?? ''),
+            'function_name' => (string)($frame['function'] ?? ''),
+            'line_number' => (int)($frame['line'] ?? 0),
+        ];
+    }
+
+
+
+    /*
+     * Normalize stack backtrace.
+     *
+     * Cleans stack rows and guarantees non-empty output shape.
+     */
+
+    private function normalizeStackBacktrace(array $items): array
+    {
+        $normalized = [];
+
+        foreach ($items as $item) {
+            $normalized[] = [
+                'file_path' => (string)($item['file_path'] ?? ''),
+                'function_name' => (string)($item['function_name'] ?? ''),
+                'line_number' => (int)($item['line_number'] ?? 0),
+            ];
+        }
+
+        if ($normalized === []) {
+            return [[
+                'file_path' => '',
+                'function_name' => '',
+                'line_number' => 0,
+            ]];
+        }
+
+        return $normalized;
+    }
+
+
+
+    /*
+     * Format PHP error message.
+     *
+     * Prefixes message with severity label.
+     */
+
+    private function formatPhpErrorMessage(PhpErrorException $e): string
+    {
+        $label = $this->phpErrorLabel($e->getSeverity());
+        return $label . ': ' . $e->getMessage();
+    }
+
+
+
+    /*
+     * Resolve PHP error label.
+     *
+     * Returns a human-readable label for a PHP error severity.
+     */
+
+    private function phpErrorLabel(int $severity): string
+    {
+        return match ($severity) {
+            E_ERROR => 'E_ERROR',
+            E_WARNING => 'E_WARNING',
+            E_PARSE => 'E_PARSE',
+            E_NOTICE => 'E_NOTICE',
+            E_CORE_ERROR => 'E_CORE_ERROR',
+            E_CORE_WARNING => 'E_CORE_WARNING',
+            E_COMPILE_ERROR => 'E_COMPILE_ERROR',
+            E_COMPILE_WARNING => 'E_COMPILE_WARNING',
+            E_USER_ERROR => 'E_USER_ERROR',
+            E_USER_WARNING => 'E_USER_WARNING',
+            E_USER_NOTICE => 'E_USER_NOTICE',
+            E_STRICT => 'E_STRICT',
+            E_RECOVERABLE_ERROR => 'E_RECOVERABLE_ERROR',
+            E_DEPRECATED => 'E_DEPRECATED',
+            E_USER_DEPRECATED => 'E_USER_DEPRECATED',
+            default => 'E_UNKNOWN',
+        };
+    }
+
+
+
+    /*
+     * Check fatal PHP error.
+     *
+     * Returns true when shutdown error type should be rendered as 500.
+     */
+
+    private function isFatalPhpErrorType(int $type): bool
+    {
+        return in_array($type, [
+            E_ERROR,
+            E_PARSE,
+            E_CORE_ERROR,
+            E_COMPILE_ERROR,
+            E_USER_ERROR,
+            E_RECOVERABLE_ERROR,
+        ], true);
+    }
+
+
+
+    /*
+     * Normalize HTTP error code.
+     *
+     * Ensures response status is a valid HTTP error status.
+     */
+
+    private function normalizeHttpErrorCode(int $code, int $fallback = 500): int
+    {
+        if ($code >= 400 && $code <= 599) {
+            return $code;
+        }
+
+        return $fallback;
+    }
+
+
+
+    /*
+     * Default error text.
+     *
+     * Returns plain fallback text for framework errors.
+     */
+
+    private function defaultErrorText(int $code): string
+    {
+        return match ($code) {
+            400 => '400 Bad Request',
+            404 => '404 Not Found',
+            default => '500 Internal Server Error',
+        };
     }
 
 
@@ -163,8 +560,39 @@ final class Kalix
             $this->locales['en'] = ['lang' => 'en'];
         }
 
+        $this->fallbackLang = $this->determineFallbackLanguage();
+    }
+
+
+
+    /*
+     * Determine fallback language.
+     *
+     * Resolves fallback locale using single/default/en-first rules.
+     */
+
+    private function determineFallbackLanguage(): string
+    {
+        if ($this->locales === []) {
+            return 'en';
+        }
+
         $keys = array_keys($this->locales);
-        $this->fallbackLang = in_array('en', $keys, true) ? 'en' : (string)$keys[0];
+        if (count($keys) === 1) {
+            return (string)$keys[0];
+        }
+
+        foreach ($this->locales as $lang => $tokens) {
+            if ((bool)($tokens['default'] ?? false) === true) {
+                return (string)$lang;
+            }
+        }
+
+        if (in_array('en', $keys, true)) {
+            return 'en';
+        }
+
+        return (string)$keys[0];
     }
 
 
@@ -402,38 +830,40 @@ final class Kalix
         $method = $this->resolveTemplate($methodTemplate, $params);
 
         if (!preg_match('/^[a-zA-Z_][a-zA-Z0-9_]*$/', $method)) {
-            throw new RuntimeException('Invalid action name: ' . $method);
+            throw new BadRequestException('Invalid action name: ' . $method);
         }
 
         if (str_starts_with($method, '_')) {
-            throw new RuntimeException('Action cannot start with underscore.');
+            throw new BadRequestException('Action cannot start with underscore.');
         }
 
         $class = $this->normalizeControllerClass($classResolved);
         if (!class_exists($class)) {
-            throw new RuntimeException('Controller not found: ' . $class);
+            throw new BadRequestException('Controller not found: ' . $class);
         }
 
         $controller = new $class();
-        $intl = $this->locales[$lang] ?? [];
-
-        Registry::set('/ctx/root', $this->rootPath);
-        Registry::set('/ctx/app', $this->appPath);
-        Registry::set('/ctx/lang', $lang);
-        Registry::set('/ctx/intl', $intl);
-        Registry::set('/ctx/locales', $this->locales);
-
-        if ($controller instanceof Controller) {
-            $controller->setContext($this->appPath, $lang, $intl);
+        if (!$controller instanceof Controller) {
+            throw new BadRequestException('Controller must extend Kalix\\Controller: ' . $class);
         }
 
+        $intl = $this->locales[$lang] ?? [];
+        $this->setRequestContext($lang, $intl);
+
+        $controller->setContext($this->appPath, $lang, $intl);
+
         if (!method_exists($controller, $method)) {
-            throw new RuntimeException('Method not found: ' . $class . '::' . $method . '()');
+            throw new BadRequestException('Method not found: ' . $class . '::' . $method . '()');
         }
 
         $reflection = new ReflectionMethod($controller, $method);
         if (!$reflection->isPublic()) {
-            throw new RuntimeException('Method is not public: ' . $class . '::' . $method . '()');
+            throw new BadRequestException('Method is not public: ' . $class . '::' . $method . '()');
+        }
+
+        $declaringClass = $reflection->getDeclaringClass()->getName();
+        if ($declaringClass !== $class) {
+            throw new BadRequestException('Action must be declared in controller class: ' . $class . '::' . $method . '()');
         }
 
         $args = [];
@@ -452,7 +882,7 @@ final class Kalix
         }
 
         if (count($args) < $reflection->getNumberOfRequiredParameters()) {
-            throw new RuntimeException('Not enough route params for action.');
+            throw new BadRequestException('Not enough route params for action.');
         }
 
         $reflection->invokeArgs($controller, $args);
@@ -528,33 +958,6 @@ final class Kalix
     }
 
 
-
-    /*
-     * Match unlocalized URL.
-     *
-     * Tries route matching without language and with stripped lang-like prefix.
-     */
-
-    private function matchWithoutLanguage(string $path): array
-    {
-        $direct = $this->routerWithoutLang->match($path);
-        if ($direct !== null) {
-            return [$direct, $path];
-        }
-
-        $stripped = $this->stripFirstSegmentIfLangLike($path);
-        if ($stripped !== $path) {
-            $match = $this->routerWithoutLang->match($stripped);
-            if ($match !== null) {
-                return [$match, $stripped];
-            }
-        }
-
-        return [null, $path];
-    }
-
-
-
     /*
      * Resolve preferred language.
      *
@@ -620,39 +1023,20 @@ final class Kalix
     }
 
 
-
-    /*
-     * Build localized path.
-     *
-     * Prefixes a plain path with the requested language code.
-     */
-
-    private function buildLocalizedPath(string $path, string $lang): string
-    {
-        $path = '/' . ltrim($path, '/');
-        if ($path !== '/') {
-            $path = rtrim($path, '/');
-        }
-
-        return $path === '/' ? '/' . $lang : '/' . $lang . $path;
-    }
-
-
-
     /*
      * Redirect.
      *
      * Sends an HTTP redirect preserving the original query string.
      */
 
-    private function redirect(string $path, string $query = ''): void
+    private function redirect(string $path, string $query = '', int $status = 302): void
     {
         $location = $path;
         if ($query !== '') {
             $location .= '?' . $query;
         }
 
-        header('Location: ' . $location, true, 302);
+        header('Location: ' . $location, true, $status);
     }
 
 
@@ -674,21 +1058,6 @@ final class Kalix
     }
 
 
-
-    /*
-     * Check localized match.
-     *
-     * Returns true when route params include a supported locale.
-     */
-
-    private function hasSupportedLang(array $match): bool
-    {
-        $lang = strtolower((string)($match['params']['lang'] ?? ''));
-        return $this->isSupportedLocale($lang);
-    }
-
-
-
     /*
      * Check supported locale.
      *
@@ -699,51 +1068,6 @@ final class Kalix
     {
         return $lang !== '' && array_key_exists($lang, $this->locales);
     }
-
-
-
-    /*
-     * Strip language placeholder.
-     *
-     * Converts `'/@lang/foo'` to `'/foo'` for redirect detection.
-     */
-
-    private function stripLangPlaceholder(string $pattern): ?string
-    {
-        if (!str_starts_with($pattern, '/@lang')) {
-            return null;
-        }
-
-        $rest = substr($pattern, strlen('/@lang'));
-        if ($rest === false || $rest === '') {
-            return '/';
-        }
-
-        return '/' . ltrim($rest, '/');
-    }
-
-
-
-    /*
-     * Strip first segment.
-     *
-     * Removes leading lang-like segment from a path when present.
-     */
-
-    private function stripFirstSegmentIfLangLike(string $path): string
-    {
-        $segments = explode('/', trim($path, '/'));
-        $first = strtolower((string)($segments[0] ?? ''));
-
-        if (!preg_match('/^[a-z]{2}$/', $first)) {
-            return $path;
-        }
-
-        array_shift($segments);
-        $rest = implode('/', $segments);
-        return $rest === '' ? '/' : '/' . $rest;
-    }
-
 
 
     /*
@@ -783,12 +1107,61 @@ final class Kalix
     /*
      * Send 404 response.
      *
-     * Sends a plain `404 Not Found` response.
+     * Renders custom or fallback `404` output.
      */
 
-    private function send404(): void
+    private function send404(?string $error = null, ?array $stackBacktrace = null): void
     {
-        http_response_code(404);
-        echo '404 Not Found';
+        if (!headers_sent()) {
+            http_response_code(404);
+        }
+
+        if ($this->dispatchErrorController(404, $error, $stackBacktrace)) {
+            return;
+        }
+
+        echo $this->defaultErrorText(404);
+    }
+
+
+
+    /*
+     * Send 400 response.
+     *
+     * Renders custom or fallback `400` output.
+     */
+
+    private function send400(?string $error = null, ?array $stackBacktrace = null): void
+    {
+        if (!headers_sent()) {
+            http_response_code(400);
+        }
+
+        if ($this->dispatchErrorController(400, $error, $stackBacktrace)) {
+            return;
+        }
+
+        echo $this->defaultErrorText(400);
+    }
+
+
+
+    /*
+     * Send 500 response.
+     *
+     * Renders custom or fallback `500` output.
+     */
+
+    private function send500(?string $error = null, ?array $stackBacktrace = null): void
+    {
+        if (!headers_sent()) {
+            http_response_code(500);
+        }
+
+        if ($this->dispatchErrorController(500, $error, $stackBacktrace)) {
+            return;
+        }
+
+        echo $this->defaultErrorText(500);
     }
 }

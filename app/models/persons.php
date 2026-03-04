@@ -3,8 +3,23 @@ declare(strict_types=1);
 
 namespace models;
 
+use Kalix\ConnectionProvider;
+
 final class persons extends \mappers\persons
 {
+
+
+    /*
+     * Construct model.
+     *
+     * Accepts an optional connection provider for DI/testing.
+     */
+
+    public function __construct(?ConnectionProvider $connections = null, string $connectionName = 'default')
+    {
+        parent::__construct($connectionName, $connections);
+    }
+
 
 
     /*

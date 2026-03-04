@@ -9,6 +9,61 @@ use RuntimeException;
 final class Db
 {
     private static array $pool = [];
+    private string $name;
+    private array $config;
+
+
+
+    /*
+     * Construct db handle.
+     *
+     * Stores connection name and resolved configuration (lazy connect).
+     */
+
+    public function __construct(string $name = 'default', ?array $config = null)
+    {
+        $this->name = $name;
+        $this->config = $config ?? self::resolveConfig($name);
+    }
+
+
+
+    /*
+     * Get connection name.
+     *
+     * Returns the database connection label used by this instance.
+     */
+
+    public function name(): string
+    {
+        return $this->name;
+    }
+
+
+
+    /*
+     * Get connection config.
+     *
+     * Returns the normalized config resolved for this instance.
+     */
+
+    public function config(): array
+    {
+        return $this->config;
+    }
+
+
+
+    /*
+     * Get mysqli connection.
+     *
+     * Returns a pooled mysqli connection for this instance config.
+     */
+
+    public function mysqli(): mysqli
+    {
+        return self::connectUsingConfig($this->config);
+    }
 
 
 
@@ -20,11 +75,24 @@ final class Db
 
     public static function connection(string $name = 'default'): mysqli
     {
+        $config = self::resolveConfig($name);
+        return self::connectUsingConfig($config);
+    }
+
+
+
+    /*
+     * Connect using config.
+     *
+     * Returns a pooled mysqli connection for the provided config array.
+     */
+
+    private static function connectUsingConfig(array $config): mysqli
+    {
         if (!extension_loaded('mysqli')) {
             throw new RuntimeException('mysqli extension is required.');
         }
 
-        $config = self::resolveConfig($name);
         $hash = md5((string)json_encode($config));
 
         if (isset(self::$pool[$hash])) {

@@ -9,9 +9,25 @@ use RuntimeException;
 
 abstract class Controller
 {
-    public string $lang = 'en';
-    public array $intl = [];
+    protected readonly string $lang;
+    protected readonly Db $db;
+    protected readonly ConnectionProvider $connections;
+    protected array $intl = [];
     private string $appPath = '';
+
+
+
+    /*
+     * Construct controller.
+     *
+     * Creates a lazy DB handle for the controller lifecycle.
+     */
+
+    public function __construct(string $connectionName = 'default', ?ConnectionProvider $connections = null)
+    {
+        $this->connections = $connections ?? new DbConnectionProvider();
+        $this->db = new Db($connectionName);
+    }
 
 
 
@@ -24,8 +40,12 @@ abstract class Controller
     public function setContext(string $appPath, string $lang, array $intl): void
     {
         $this->appPath = rtrim($appPath, '/');
-        $this->lang = $lang;
+        if (!isset($this->lang)) {
+            $this->lang = $lang;
+        }
+
         $this->intl = $intl;
+        $this->persistLanguageCookie($this->lang);
     }
 
 
@@ -38,6 +58,8 @@ abstract class Controller
 
     protected function render(array $params = []): void
     {
+        $params['lang'] = $this->lang;
+
         $action = $this->resolveActionName();
         $view = $this->resolveViewFile($action);
         $html = $this->includeView($view, $params, $this->intl);
@@ -165,5 +187,36 @@ abstract class Controller
         }
 
         return htmlspecialchars((string)$value, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+    }
+
+
+
+    /*
+     * Encode to base64url.
+     *
+     * Encodes a string as URL-safe base64 without padding.
+     */
+
+    public function toBase64(string $value): string
+    {
+        return rtrim(strtr(base64_encode($value), '+/', '-_'), '=');
+    }
+
+
+
+    /*
+     * Persist language cookie.
+     *
+     * Stores current language for future routing fallbacks.
+     */
+
+    private function persistLanguageCookie(string $lang): void
+    {
+        setcookie('lang', $lang, [
+            'expires' => time() + (86400 * 365),
+            'path' => '/',
+            'httponly' => false,
+            'samesite' => 'Lax',
+        ]);
     }
 }
